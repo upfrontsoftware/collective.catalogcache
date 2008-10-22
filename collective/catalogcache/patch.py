@@ -9,16 +9,18 @@ from DateTime import DateTime
 from md5 import md5
 import time
 from Products.ZCatalog.Catalog import LOG
+from os import environ
 
 try:
     import memcache
-    #mem_cache = memcache.Client(['127.0.0.1:11211'], debug=0)
-    li = ['127.0.0.1:11211',
-        '127.0.0.1:11212',
-        '127.0.0.1:11213',
-        '127.0.0.1:11214',]
-    mem_cache = memcache.Client(li, debug=0)
-    HAS_MEMCACHE = True
+    s = environ.get('MEMCACHE_SERVERS', '')
+    if s:
+        servers = s.split(',')
+    if not servers:
+        HAS_MEMCACHE = False
+    else:
+        mem_cache = memcache.Client(servers, debug=0)
+        HAS_MEMCACHE = True
 
 except ImportError:
     mem_cache = None
