@@ -1,32 +1,53 @@
+import BTrees.Length
+from BTrees.IIBTree import intersection, weightedIntersection, IISet
+from BTrees.OIBTree import OIBTree
+from BTrees.IOBTree import IOBTree
+from Products.ZCatalog.Lazy import LazyMap, LazyCat
+import types
+
+from DateTime import DateTime
 from md5 import md5
 import time
+from Products.ZCatalog.Catalog import LOG
 
 try:
     import memcache
-    mem_cache = memcache.Client(['127.0.0.1:11211'], debug=0)
+    #mem_cache = memcache.Client(['127.0.0.1:11211'], debug=0)
+    li = ['127.0.0.1:11211',
+        '127.0.0.1:11212',
+        '127.0.0.1:11213',
+        '127.0.0.1:11214',]
+    mem_cache = memcache.Client(li, debug=0)
     HAS_MEMCACHE = True
+
 except ImportError:
     mem_cache = None
     HAS_MEMCACHE = False
 
-MEM_CACHE_DURATION = 7200
+MEMCACHE_DURATION = 7200
+MEMCACHE_RETRY_INTERVAL = 10
 memcache_insertion_timestamps = {}
 _hits = {}
 _misses = {}
-_set_multi_success = {}
-_set_multi_failure = {}
-_set_multi_failure_timestamp = 0
+_memcache_failure_timestamp = 0
+_cache_misses = {}
+
+def _memcache_available(self):
+    global HAS_MEMCACHE, MEMCACHE_RETRY_INTERVAL, _memcache_failure_timestamp
+    if not HAS_MEMCACHE:
+        return False
+
+    now_seconds = int(time.time())
+    if now_seconds - _memcache_failure_timestamp < MEMCACHE_RETRY_INTERVAL:
+        return False
+
+    _memcache_failure_timestamp = 0
+    return True
 
 def _cache_result(self, cache_key, rs, search_indexes=[]):
-    global mem_cache, HAS_MEMCACHE, MEM_CACHE_DURATION, \
-        _set_multi_failure_timestamp
-    if not HAS_MEMCACHE:
-        return
+    global mem_cache, MEMCACHE_DURATION,  _memcache_failure_timestamp
 
-    # Give memcached a break on failures
-    now_seconds = int(time.time())
-    if now_seconds - _set_multi_failure_timestamp < 30:
-        #LOG.info("Giving memcached a break")
+    if not self._memcache_available():
         return
 
     # Insane case. This only happens when search returns everything 
@@ -62,76 +83,78 @@ def _cache_result(self, cache_key, rs, search_indexes=[]):
         to_set[k].extend(v)
 
     if to_set:
-        # During a large number of new queries (and hence new calls to
-        # this) method we may try to set the same to_set in memcache
-        # over and over again, and all of them will timeout in the
-        # python memcache wrapper. The inserts will probably still take
-        # place, but it will be the same to_set applied many times. This
-        # is obviously redundant and will cause memcache to consume too
-        # much CPU. To overcome this we abide by this rule: you cannot
-        # insert the same set more than once every N seconds.
+        now_seconds = int(time.time())
 
+        # During a large number of new queries (and hence new calls to this) method
+        # we may try to set the same to_set in memcache over and over again, and
+        # all of them will timeout in the python memcache wrapper. The inserts will 
+        # probably still take place, but it will be the same to_set applied many
+        # times. This is obviously redundant and will cause memcache to consume too
+        # much CPU. 
+        # To overcome this we abide by this rule: you cannot insert the same set more 
+        # than once every N seconds.           
         li = to_set.items()
         li.sort()
         hash = md5(str(li)).hexdigest()
         if (now_seconds - memcache_insertion_timestamps.get(hash, 0)) < 10:
-            LOG.debug("Prevent a call to set_multi since the same insert "
-                      "was done recently")
+            LOG.debug("Prevent a call to set_multi since the same insert was done recently")
             return
-        memcache_insertion_timestamps[hash] = now_seconds           
+        memcache_insertion_timestamps[hash] = now_seconds                       
 
         # An edge case in the python memcache wrapper requires that
         # we catch TypeErrors.
         try:
-            ret = mem_cache.set_multi(to_set, key_prefix=cache_id,
-                time=MEM_CACHE_DURATION)
+            ret = mem_cache.set_multi(to_set, key_prefix=cache_id, time=MEMCACHE_DURATION)
         except TypeError:
             return
         # Return value of non-empty list indicates error
         if isinstance(ret, types.ListType) and len(ret):
-            _set_multi_failure.setdefault(cache_id, 0)
-            _set_multi_failure[cache_id] += 1
-            _set_multi_failure_timestamp = now_seconds
-            LOG.debug("_cache_result set_multi failed")
-            # Run a little diagnostic since the return value of set_multi is 
-            # the original to_set list in case of daemon not responding.
-            if len(ret) == len(to_set):
-                if mem_cache.set('zcatalog_diagnostic', 1) != 0:
-                    LOG.debug("The memcached daemon is responding. Perhaps "
-                              "set_multi exceeded its memory.")
-                else:
-                    LOG.debug("The memcached daemon is not responding. It "
-                              "may be too busy. You need to investigate this "
-                              "on the server.")
-            else:
-                LOG.error("Some keys were successfully written to memcached. "
-                          "This case needs further handling.")
-                # xxx: may do a self._clear_cache() ?
-        else:                
-            _set_multi_success.setdefault(cache_id, 0)
-            _set_multi_success[cache_id] += 1
-            _set_multi_failure_timestamp = 0
+            LOG.error("_cache_result set_multi failed") 
+            _memcache_failure_timestamp = now_seconds
+            # The return value of set_multi is the original to_set list in 
+            # case of no daemons  responding.
+            if len(ret) != len(to_set):
+                LOG.error("Some keys were successfully written to memcache. This case needs further handling.")
+                # xxx: maybe do a self._clear_cache()?
 
 def _get_cached_result(self, cache_key, default=[]):
-    global mem_cache, HAS_MEMCACHE
-    if not HAS_MEMCACHE:
+    global mem_cache, _memcache_failure_timestamp
+
+    if not self._memcache_available():
         return default
+
     cache_id = '/'.join(self.getPhysicalPath())
-    res = mem_cache.get(cache_id+cache_key)
-    # todo: Return default is any item in rs is not an integer. How?        
+    key = cache_id + cache_key
+    _cache_misses.setdefault(key, 0)
+    res = mem_cache.get(key)
+    # todo: Return default if any item in rs is not an integer. How?        
     if res is None:
+        # Record the time of the miss. If we keep missing this key
+        # then something is wrong with memcache and we must stop
+        # hitting it for a while.
+        now_seconds = int(time.time())           
+        if _cache_misses.get(key, 0) > 10:
+            LOG.error("_get_cache_key failed 10 times") 
+            _memcache_failure_timestamp = now_seconds
+            _cache_misses.clear()
+        else:
+            if _cache_misses.has_key(key):
+                _cache_misses[key] += 1
         return default
+
+    _cache_misses[key] = 0       
     return res
 
 def _invalidate_cache(self, rid=None, index_name=''):
     """ Invalidate cached results affected by rid and / or index_name
     """
-    global mem_cache, HAS_MEMCACHE
-    if not HAS_MEMCACHE:
+    global mem_cache, _memcache_failure_timestamp
+
+    if not self._memcache_available():
         return
+
     cache_id = '/'.join(self.getPhysicalPath())
-    LOG.debug('[%s] _invalidate_cache rid=%s, index_name=%s' % (
-        cache_id, rid, index_name))
+    LOG.debug('[%s] _invalidate_cache rid=%s, index_name=%s' % (cache_id, rid, index_name))
 
     to_delete = []
 
@@ -153,24 +176,23 @@ def _invalidate_cache(self, rid=None, index_name=''):
             to_delete.append(s_index_name)
 
     if to_delete:
-        LOG.debug('[%s] Remove %s items from cache' % (cache_id,
-            len(to_delete)))
+        now_seconds = int(time.time())
+        LOG.debug('[%s] Remove %s items from cache' % (cache_id, len(to_delete)))
         # Return value of 1 indicates no error
         if mem_cache.delete_multi(to_delete) != 1:
             LOG.error("_invalidate_cache delete_multi failed")
+            _memcache_failure_timestamp = now_seconds
 
 def _clear_cache(self):
-    global mem_cache, HAS_MEMCACHE
-    if not HAS_MEMCACHE:
-        return default
+    global mem_cache
+    if not self._memcache_available():
+        return
     LOG.debug('Flush cache')
     # No return value for flush_all
     # xxx: investigate whether all caches need to be flushed
     mem_cache.flush_all()
     _hits.clear()
     _misses.clear()
-    _set_multi_success.clear()
-    _set_multi_failure.clear()
 
 def _get_cache_key(self, args):
 
@@ -221,6 +243,7 @@ def _get_search_indexes(self, args):
     keys.extend(list(args.keywords.keys()))
     return keys
 
+# Methods clear, catalog, uncatalogObject, search are from the default Catalog.py
 def clear(self):
     """ clear catalog """
 
@@ -233,9 +256,8 @@ def clear(self):
     for index in self.indexes.keys():
         self.getIndex(index).clear()
 
-
 def catalogObject(self, object, uid, threshold=None, idxs=None,
-                    update_metadata=1):
+                  update_metadata=1):
     """
     Adds an object to the Catalog by iteratively applying it to
     all indexes.
@@ -300,7 +322,6 @@ def catalogObject(self, object, uid, threshold=None, idxs=None,
 
     return total
 
-
 def uncatalogObject(self, uid):
     """
     Uncatalog and object from the Catalog.  and 'uid' is a unique
@@ -335,10 +356,8 @@ def uncatalogObject(self, uid):
         
     else:
         LOG.error('uncatalogObject unsuccessfully '
-                    'attempted to uncatalog an object '
-                    'with a uid of %s. ' % str(uid))
-
-
+                  'attempted to uncatalog an object '
+                  'with a uid of %s. ' % str(uid))
 
 def search(self, request, sort_index=None, reverse=0, limit=None, merge=1):
     """Iterate through the indexes, applying the query to each one. If
@@ -377,7 +396,7 @@ def search(self, request, sort_index=None, reverse=0, limit=None, merge=1):
     rs = self._get_cached_result(cache_key, marker)
 
     if rs is marker:
-        LOG.debug('[%s] MISS: %s' % (cache_id, cache_key))
+        LOG.debug('[%s] MISS: %s' % (cache_id, cache_key)) 
         rs = None
         for i in self.indexes.keys():
             index = self.getIndex(i)
@@ -394,10 +413,11 @@ def search(self, request, sort_index=None, reverse=0, limit=None, merge=1):
         LOG.debug("[%s] Search indexes = %s" % (cache_id, str(search_indexes)))
         self._cache_result(cache_key, rs, search_indexes)
 
-        _misses[cache_id] += 1
+        if _misses.has_key(cache_id):
+            _misses[cache_id] += 1
     else:
-        #LOG.debug('[%s] HIT: %s' % (cache_id, cache_key))
-        _hits[cache_id] += 1
+        if _hits.has_key(cache_id):
+            _hits[cache_id] += 1
 
     # Output stats
     if int(time.time()) % 10 == 0:
@@ -405,11 +425,6 @@ def search(self, request, sort_index=None, reverse=0, limit=None, merge=1):
         if hits:
             misses = _misses.get(cache_id, 0)
             LOG.info('[%s] Hit rate: %.2f%%' % (cache_id, hits*100.0/(hits+misses)))
-
-        set_multi_success = _set_multi_success.get(cache_id, 0)
-        if set_multi_success:
-            set_multi_failure = _set_multi_failure.get(cache_id, 0)
-            LOG.info('[%s] set_multi success rate: %.2f%%' % (cache_id, set_multi_success*100.0/(set_multi_success+set_multi_failure)))
 
     if rs is None:
         # None of the indexes found anything to do with the request
@@ -475,8 +490,8 @@ def search(self, request, sort_index=None, reverse=0, limit=None, merge=1):
         # Empty result set
         return LazyCat([])
 
-
 from Products.ZCatalog.Catalog import Catalog
+Catalog._memcache_available = _memcache_available
 Catalog._cache_result = _cache_result
 Catalog._get_cached_result = _get_cached_result
 Catalog._invalidate_cache = _invalidate_cache
