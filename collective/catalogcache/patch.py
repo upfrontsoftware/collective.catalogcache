@@ -140,8 +140,10 @@ def _get_cached_result(self, cache_key, default=[]):
             _memcache_failure_timestamp = now_seconds
             _cache_misses.clear()
         else:
-            if _cache_misses.has_key(key):
+            try:
                 _cache_misses[key] += 1
+            except KeyError:
+                pass
         return default
 
     _cache_misses[key] = 0       
@@ -415,11 +417,15 @@ def search(self, request, sort_index=None, reverse=0, limit=None, merge=1):
         LOG.debug("[%s] Search indexes = %s" % (cache_id, str(search_indexes)))
         self._cache_result(cache_key, rs, search_indexes)
 
-        if _misses.has_key(cache_id):
+        try:
             _misses[cache_id] += 1
+        except KeyError:
+            pass
     else:
-        if _hits.has_key(cache_id):
+        try:
             _hits[cache_id] += 1
+        except KeyError:
+            pass
 
     # Output stats
     if int(time.time()) % 10 == 0:
