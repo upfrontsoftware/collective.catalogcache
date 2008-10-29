@@ -17,14 +17,17 @@ try:
     if s:
         servers = s.split(',')
     if not servers:
+        LOG.info("No memcached servers defined. Catalog will function as normal.")
         HAS_MEMCACHE = False
     else:
         mem_cache = memcache.Client(servers, debug=0)
         HAS_MEMCACHE = True
+        LOG.info("Using memcached servers %s" % ",".join(servers))
 
 except ImportError:
     mem_cache = None
     HAS_MEMCACHE = False
+    LOG.info("Cannot import memcached. Catalog will function as normal.")
 
 MEMCACHE_DURATION = 7200
 MEMCACHE_RETRY_INTERVAL = 10
@@ -87,7 +90,7 @@ def _cache_result(self, cache_key, rs, search_indexes=[]):
     if to_set:
         now_seconds = int(time.time())
 
-        # During a large number of new queries (and hence new calls to this) method
+        # During a large number of new queries (and hence new calls to this method)
         # we may try to set the same to_set in memcache over and over again, and
         # all of them will timeout in the python memcache wrapper. The inserts will 
         # probably still take place, but it will be the same to_set applied many
@@ -115,7 +118,7 @@ def _cache_result(self, cache_key, rs, search_indexes=[]):
             _memcache_failure_timestamp = now_seconds
             # The return value of set_multi is the original to_set list in 
             # case of no daemons  responding.
-            if len(ret) != len(to_set):
+            if len(ret) != len(to_set.keys()):
                 LOG.error("Some keys were successfully written to memcache. This case needs further handling.")
                 # xxx: maybe do a self._clear_cache()?
 
@@ -193,7 +196,9 @@ def _clear_cache(self):
         return
     LOG.debug('Flush cache')
     # No return value for flush_all
-    # xxx: investigate whether all caches need to be flushed
+    # xxx: This flushes all caches which is inefficient. Currently
+    # there is no way to delete all keys starting with eg. 
+    # /site/portal_catalog
     mem_cache.flush_all()
     _hits.clear()
     _misses.clear()
@@ -498,6 +503,35 @@ def search(self, request, sort_index=None, reverse=0, limit=None, merge=1):
         # Empty result set
         return LazyCat([])
 
+def __getitem__(self, index, ttype=type(())):
+    """
+    Returns instances of self._v_brains, or whatever is passed
+    into self.useBrains.
+    """
+    if type(index) is ttype:
+        # then it contains a score...
+        normalized_score, score, key = index
+        # Memcache may be responsible for this bad key. Invalidate the
+        # cache and let the exception take place. This should never be
+        # needed since we started using transaction aware caching.
+        if not self.data.has_key(key) or not isinstance(key, types.IntType):
+            LOG.error("Weighted rid %s leads to KeyError. Removing from cache." % index)
+            self._invalidate_cache(rid=index)
+        r=self._v_result_class(self.data[key]).__of__(self.aq_parent)
+        r.data_record_id_ = key
+        r.data_record_score_ = score
+        r.data_record_normalized_score_ = normalized_score
+    else:
+        # otherwise no score, set all scores to 1
+        if not self.data.has_key(index) or not isinstance(index, types.IntType):
+            LOG.error("rid %s leads to KeyError. Removing from cache." % index)
+            self._invalidate_cache(rid=index)
+        r=self._v_result_class(self.data[index]).__of__(self.aq_parent)
+        r.data_record_id_ = index
+        r.data_record_score_ = 1
+        r.data_record_normalized_score_ = 1
+    return r
+
 from Products.ZCatalog.Catalog import Catalog
 Catalog._memcache_available = _memcache_available
 Catalog._cache_result = _cache_result
@@ -510,3 +544,4 @@ Catalog.clear = clear
 Catalog.catalogObject = catalogObject
 Catalog.uncatalogObject = uncatalogObject
 Catalog.search = search
+Catalog.__getitem__ = __getitem__
