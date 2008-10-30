@@ -105,6 +105,10 @@ class MemcachedAdapter(object):
         return self.memcache.get(key)
 
     def get_multi(self, to_get, key_prefix):
+        if not to_get:
+            # Nothing to do
+            return {}
+
         result = {}
         error = False
         txn = transaction.get()       
@@ -131,7 +135,11 @@ class MemcachedAdapter(object):
             return {}
         return result
 
-    def delete_multi(self, to_delete, immediate=False):
+    def delete_multi(self, to_delete, immediate=False):        
+        if not to_delete:
+            # Nothing to do
+            return 1
+
         if immediate:
             return self.memcache.delete_multi(to_delete)
 
@@ -144,6 +152,8 @@ class MemcachedAdapter(object):
                         del txn.v_cache[k]
                     except KeyError:
                         pass
+
+        return 1
 
     def flush_all(self):
         txn = transaction.get()
