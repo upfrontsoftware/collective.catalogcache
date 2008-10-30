@@ -156,7 +156,8 @@ try:
     s = environ.get('MEMCACHE_SERVERS', '')
     if s:
         servers = s.split(',')
-    if not servers:
+
+    if not s:
         HAS_MEMCACHE = False
         LOG.info("No memcached servers defined. Catalog will function as normal.")
 
