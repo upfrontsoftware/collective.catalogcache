@@ -20,7 +20,8 @@ class MemcachedDataManager(object):
 
     implements(IDataManager)
 
-    def __init__(self, cacheadapter, key_prefix='', to_set={}, to_delete=[], duration=None):
+    def __init__(self, id, cacheadapter, key_prefix='', to_set={}, to_delete=[], duration=None):
+        self.id = id
         self.cacheadapter = cacheadapter
         self.key_prefix = key_prefix
         self.to_set = to_set
@@ -53,18 +54,18 @@ class MemcachedDataManager(object):
         pass
 
     def sortKey(self):
-        items = self.to_set.items()
-        items.extend(self.to_delete)
-        items.sort()
-        return '%s_%s' % (self.key_prefix, str(items))
+        return 'MemcachedDataManager%s' % self.id 
 
 class MemcachedAdapter(object):
 
     def __init__(self, memcache):
         self.memcache = memcache
+        self.counter = 1000000
 
     def set_multi(self, to_set, key_prefix, duration, immediate=False):
         global _memcache_failure_timestamp
+
+        #LOG.debug("set multi (%s): %s" % (immediate, repr(to_set)))
 
         if immediate:
             # An edge case in the python memcache wrapper requires that
@@ -88,14 +89,30 @@ class MemcachedAdapter(object):
             return result
 
         txn = transaction.get()
-        txn.join(MemcachedDataManager(self, key_prefix=key_prefix, to_set=to_set, duration=duration))
+        txn.join(MemcachedDataManager(self.counter, self, key_prefix=key_prefix, to_set=to_set, duration=duration))
+        self.counter += 1
         if not hasattr(txn, 'v_cache'):
             txn.v_cache = dict()
         for k,v in to_set.items():
-            txn.v_cache[k] = v
+            s_k = key_prefix + str(k)
+            # Add to v_cache
+            txn.v_cache[s_k] = v
+            # Remove from v_delete_cache
+            if hasattr(txn, 'v_delete_cache') and (s_k in txn.v_delete_cache):            
+                try:
+                    txn.v_delete_cache.remove(s_k)
+                except ValueError:
+                    pass
 
-    def get(self, key):
+    def get(self, key, default=[]):
+        """
+        Parameter key is already prefixed
+        """
         txn = transaction.get()
+
+        if hasattr(txn, 'v_delete_cache') and (key in txn.v_delete_cache):
+            return default
+
         if hasattr(txn, 'v_cache') and txn.v_cache.has_key(key):            
             try:
                 return txn.v_cache[key]
@@ -112,12 +129,24 @@ class MemcachedAdapter(object):
         result = {}
         error = False
         txn = transaction.get()       
+
+        # If any key is in v_delete_cache then to_get must be adjusted
+        new_to_get = []
+        if hasattr(txn, 'v_delete_cache'):
+            for k in to_get:
+                s_k = key_prefix + str(k)
+                if s_k not in txn.v_delete_cache:
+                    new_to_get.append(k)
+        else:
+            new_to_get = to_get
+
         # All keys in to_get must be in v_cache else we ask memcache
         if hasattr(txn, 'v_cache'):            
-            for k in to_get:
-                if txn.v_cache.has_key(k):
+            for k in new_to_get:
+                s_k = key_prefix + str(k)
+                if txn.v_cache.has_key(s_k):
                     try:
-                        result[k] = txn.v_cache[k] 
+                        result[k] = txn.v_cache[s_k] 
                     except KeyError:
                         error = True
                         break
@@ -126,25 +155,38 @@ class MemcachedAdapter(object):
                     break
             if not error:
                 return result
-
+        
         # An edge case in the python memcache wrapper requires that
         # we catch KeyErrors.
         try:        
-            result = self.memcache.get_multi(to_get, key_prefix=key_prefix)
+            result = self.memcache.get_multi(new_to_get, key_prefix=key_prefix)
         except KeyError:
             return {}
         return result
 
     def delete_multi(self, to_delete, immediate=False):        
+        """
+        All elements in to_delete are already prefixed
+        """
         if not to_delete:
             # Nothing to do
             return 1
+
+        #LOG.debug("delete multi (%s): %s" % (immediate, repr(to_delete)))
 
         if immediate:
             return self.memcache.delete_multi(to_delete)
 
         txn = transaction.get()
-        txn.join(MemcachedDataManager(self, to_delete=to_delete))
+
+        if not hasattr(txn, 'v_delete_cache'):
+            txn.v_delete_cache = []
+        for k in to_delete:
+            if k not in txn.v_delete_cache:
+                txn.v_delete_cache.append(k)
+
+        txn.join(MemcachedDataManager(self.counter, self, to_delete=to_delete))
+        self.counter += 1
         if hasattr(txn, 'v_cache'):
             for k in to_delete:
                 if txn.v_cache.has_key(k):
@@ -159,6 +201,8 @@ class MemcachedAdapter(object):
         txn = transaction.get()
         if hasattr(txn, 'v_cache'):
             txn.v_cache.clear()
+        if hasattr(txn, 'v_cache'):
+            txn.v_delete_cache = []
         return self.memcache.flush_all()
 
 try:
@@ -279,7 +323,7 @@ def _get_cached_result(self, cache_key, default=[]):
     cache_id = '/'.join(self.getPhysicalPath())
     key = cache_id + cache_key
     _cache_misses.setdefault(key, 0)
-    result = MemcachedAdapter(mem_cache).get(key)
+    result = MemcachedAdapter(mem_cache).get(key, default)
     # todo: Return default if any item in rs is not an integer. How?        
     if result is None:
         # Record the time of the miss. If we keep missing this key
@@ -318,17 +362,17 @@ def _invalidate_cache(self, rid=None, index_name='', immediate=False):
 
     if rid is not None:
         s_rid = cache_id + str(rid)
-        rid_map = MemcachedAdapter(mem_cache).get(s_rid)        
+        rid_map = MemcachedAdapter(mem_cache).get(s_rid, [])        
         if rid_map is not None:
             to_delete.extend(rid_map)
-            to_delete.append(s_rid)
+        to_delete.append(s_rid)
 
     if index_name:
         s_index_name = cache_id + index_name
-        index_map = MemcachedAdapter(mem_cache).get(s_index_name) 
+        index_map = MemcachedAdapter(mem_cache).get(s_index_name, []) 
         if index_map is not None:
             to_delete.extend(index_map)
-            to_delete.append(s_index_name)
+        to_delete.append(s_index_name)
 
     if to_delete:
         now_seconds = int(time.time())
@@ -575,6 +619,7 @@ def search(self, request, sort_index=None, reverse=0, limit=None, merge=1):
         except KeyError:
             pass
     else:
+        #LOG.debug('[%s] HIT: %s' % (cache_id, cache_key)) 
         try:
             _hits[cache_id] += 1
         except KeyError:
