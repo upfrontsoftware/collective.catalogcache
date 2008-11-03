@@ -5,13 +5,12 @@ version = '0.1'
 
 setup(name='collective.catalogcache',
       version=version,
-      description="Cache ZCatalog results with memcached - experimental!",
+      description="Cache ZCatalog results with memcached - experimental",
       long_description=open("README.txt").read() + "\n" +
                        open(os.path.join("docs", "HISTORY.txt")).read(),
       # Get more strings from http://www.python.org/pypi?%3Aaction=list_classifiers
       classifiers=[
         "Framework :: Zope2",
-        "Framework :: Zope3"
         "Programming Language :: Python",
         "Topic :: Software Development :: Libraries :: Python Modules",
         ],
