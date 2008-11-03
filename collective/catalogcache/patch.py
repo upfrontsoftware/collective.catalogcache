@@ -11,6 +11,10 @@ import time
 from Products.ZCatalog.Catalog import LOG
 from os import environ
 
+import transaction
+from zope.interface import implements
+from transaction.interfaces import IDataManager
+
 try:
     import memcache
     s = environ.get('MEMCACHE_SERVERS', '')
@@ -18,8 +22,9 @@ try:
         servers = s.split(',')
 
     if not s:
-        LOG.info("No memcached servers defined. Catalog will function as normal.")
         HAS_MEMCACHE = False
+        LOG.info("No memcached servers defined. Catalog will function as normal.")
+
     else:
         mem_cache = memcache.Client(servers, debug=0)
         HAS_MEMCACHE = True
@@ -38,6 +43,246 @@ _misses = {}
 _memcache_failure_timestamp = 0
 _cache_misses = {}
 
+class MemcachedDataManager(object):
+
+    implements(IDataManager)
+
+    def __init__(self, id, cacheadapter, key_prefix='', to_set={}, to_delete=[], duration=None):
+        self.id = id
+        self.cacheadapter = cacheadapter
+        self.key_prefix = key_prefix
+        self.to_set = to_set
+        self.to_delete = to_delete
+        self.duration = duration
+
+    def abort(self, trans):
+        pass
+
+    def commit(self, trans):
+        pass
+
+    def tpc_begin(self, trans):
+        pass
+
+    def tpc_vote(self, trans):
+        self.cacheadapter.commit()        
+
+    def tpc_finish(self, trans):
+        pass
+
+    def tpc_abort(self, trans):
+        pass
+
+    def sortKey(self):
+        return 'MemcachedDataManager%s' % self.id 
+
+class MemcachedAdapter(object):
+
+    def __init__(self, memcache, default_duration):
+        self.memcache = memcache
+        self.default_duration = default_duration
+        self.counter = 1000000        
+        txn = transaction.get()
+        txn.join(MemcachedDataManager(self.counter, self))
+
+    def set_multi(self, to_set, key_prefix, duration=None, immediate=False):
+        """
+        Returns: 
+            failure: (a) list of keys which failed to be stored or 
+                     (b) False if no memcache servers could be reached
+            success: empty list
+        """
+        global _memcache_failure_timestamp
+
+        #LOG.debug("set multi (%s): %s" % (immediate, repr(to_set)))
+
+        if immediate:
+            # An edge case in the python memcache wrapper requires that
+            # we catch TypeErrors.
+            try:
+                result = self.memcache.set_multi(to_set, key_prefix=key_prefix, time=duration or self.default_duration)
+            except TypeError:
+                return False
+
+            # xxx: I hate this code here. Make it a callback so transaction commit
+            # can set _memcache_failure_timestamp
+            # Return value of non-empty list indicates error
+            if isinstance(result, types.ListType) and len(result):
+                LOG.error("_cache_result set_multi failed") 
+                _memcache_failure_timestamp = int(time.time())
+                # The return value of set_multi is the original to_set list in 
+                # case of no daemons responding.
+                if len(result) != len(to_set.keys()):
+                    LOG.error("Some keys were successfully written to memcache. This case needs further handling.")
+
+            return result
+
+        txn = transaction.get()
+        self.counter += 1
+        if not hasattr(txn, 'v_cache'):
+            txn.v_cache = dict()
+        for k,v in to_set.items():
+            s_k = key_prefix + str(k)
+            # Add to v_cache
+            txn.v_cache[s_k] = v
+            # Remove from v_delete_cache
+            if hasattr(txn, 'v_delete_cache') and (s_k in txn.v_delete_cache):            
+                try:
+                    txn.v_delete_cache.remove(s_k)
+                except ValueError:
+                    pass
+
+    def get(self, key, default=[]):
+        """
+        Parameter key is already prefixed
+
+        Returns: 
+            success: value
+            failure: default
+        """
+        txn = transaction.get()
+
+        if hasattr(txn, 'v_delete_cache') and (key in txn.v_delete_cache):
+            return default
+
+        if hasattr(txn, 'v_cache') and txn.v_cache.has_key(key):            
+            try:
+                return txn.v_cache[key]
+            except KeyError:
+                pass
+
+        result = self.memcache.get(key)
+        if result is None:
+            return default
+        return result
+
+    def get_multi(self, to_get, key_prefix):
+        """
+        Returns: 
+            success, failure: dictionary
+        """
+        if not to_get:
+            # Nothing to do
+            return {}
+
+        txn = transaction.get()       
+
+        # If any key is in v_delete_cache then to_get must be adjusted
+        new_to_get = []
+        if hasattr(txn, 'v_delete_cache'):
+            for k in to_get:
+                s_k = key_prefix + str(k)
+                if s_k not in txn.v_delete_cache:
+                    new_to_get.append(k)
+        else:
+            new_to_get = to_get
+
+        result_cache = {}
+        keys_still_to_get = []
+        # Try and find the keys in v_cache
+        if hasattr(txn, 'v_cache'):            
+            for k in new_to_get:
+                s_k = key_prefix + str(k)
+                if txn.v_cache.has_key(s_k):
+                    try:
+                        result_cache[k] = txn.v_cache[s_k]                         
+                    except KeyError:
+                        keys_still_to_get.append(k)
+                else:
+                    keys_still_to_get.append(k)
+        else:
+            keys_still_to_get = new_to_get
+       
+        result_memcache = {} 
+        if keys_still_to_get:
+            # An edge case in the python memcache wrapper requires that
+            # we catch KeyErrors.
+            try:        
+                result_memcache = self.memcache.get_multi(keys_still_to_get, key_prefix=key_prefix)
+            except KeyError:
+                pass
+
+        # Collate the result sets
+        result_memcache.update(result_cache)
+
+        return result_memcache
+
+    def delete_multi(self, to_delete, immediate=False):        
+        """
+        All elements in to_delete are already prefixed
+
+        Returns:
+            success: 1
+            failure: not 1
+        """
+        if not to_delete:
+            # Nothing to do
+            return 1
+
+        #LOG.debug("delete multi (%s): %s" % (immediate, repr(to_delete)))
+
+        if immediate:
+            return self.memcache.delete_multi(to_delete)
+
+        txn = transaction.get()
+
+        if not hasattr(txn, 'v_delete_cache'):
+            txn.v_delete_cache = []
+        for k in to_delete:
+            if k not in txn.v_delete_cache:
+                txn.v_delete_cache.append(k)
+
+        self.counter += 1
+        if hasattr(txn, 'v_cache'):
+            for k in to_delete:
+                if txn.v_cache.has_key(k):
+                    try:
+                        del txn.v_cache[k]
+                    except KeyError:
+                        pass
+
+        return 1
+
+    def flush_all(self):
+        """
+        Returns:
+            success, failure: undefined
+        """
+        txn = transaction.get()
+        if hasattr(txn, 'v_cache'):
+            txn.v_cache.clear()
+        if hasattr(txn, 'v_cache'):
+            txn.v_delete_cache = []
+        return self.memcache.flush_all()
+
+    def commit(self):
+        """
+        Do one atomic commit. This is in fact not atomic since the memcached wrapper
+        needs more work but it is the best we can do.
+        """
+        txn = transaction.get()
+        if hasattr(txn, 'v_delete_cache'):
+            if self.delete_multi(to_delete=txn.v_delete_cache, immediate=True) != 1:
+                LOG.error("_invalidate_cache delete_multi failed")
+            txn.v_delete_cache = []
+
+        if hasattr(txn, 'v_cache'):
+            result_set = self.set_multi(to_set=txn.v_cache, 
+                key_prefix='', 
+                duration=self.default_duration, 
+                immediate=True)
+            txn.v_cache.clear()            
+            # Error logging is handled by the set_multi method
+
+        # xxx: consider what to do in case of failures
+
+def _getMemcachedAdapter(self):
+    global mem_cache, MEMCACHE_DURATION
+    txn = transaction.get()
+    if not hasattr(txn, 'v_memcached_adapter'):
+        txn.v_memcached_adapter = MemcachedAdapter(mem_cache, default_duration=MEMCACHE_DURATION) 
+    return txn.v_memcached_adapter
+
 def _memcache_available(self):
     global HAS_MEMCACHE, MEMCACHE_RETRY_INTERVAL, _memcache_failure_timestamp
     if not HAS_MEMCACHE:
@@ -51,7 +296,7 @@ def _memcache_available(self):
     return True
 
 def _cache_result(self, cache_key, rs, search_indexes=[]):
-    global mem_cache, MEMCACHE_DURATION,  _memcache_failure_timestamp
+    global MEMCACHE_DURATION,  _memcache_failure_timestamp
 
     if not self._memcache_available():
         return
@@ -78,12 +323,7 @@ def _cache_result(self, cache_key, rs, search_indexes=[]):
         to_set[idx] = [lcache_key]
 
     # Augment the values of to_set with possibly existing values
-    # An edge case in the python memcache wrapper requires that
-    # we catch KeyErrors.
-    try:        
-        result = mem_cache.get_multi(to_get, key_prefix=cache_id)
-    except KeyError:
-        return
+    result = self._getMemcachedAdapter().get_multi(to_get, key_prefix=cache_id)
     for k,v in result.items():
         if not isinstance(v, types.ListType): continue
         to_set[k].extend(v)
@@ -107,24 +347,25 @@ def _cache_result(self, cache_key, rs, search_indexes=[]):
             return
         memcache_insertion_timestamps[hash] = now_seconds                       
 
-        # An edge case in the python memcache wrapper requires that
-        # we catch TypeErrors.
-        try:
-            ret = mem_cache.set_multi(to_set, key_prefix=cache_id, time=MEMCACHE_DURATION)
-        except TypeError:
+        result = self._getMemcachedAdapter().set_multi(to_set, key_prefix=cache_id, duration=MEMCACHE_DURATION)
+        if result == False:
             return
+
+        '''
+        # xxx: restore later
         # Return value of non-empty list indicates error
-        if isinstance(ret, types.ListType) and len(ret):
+        if isinstance(result, types.ListType) and len(result):
             LOG.error("_cache_result set_multi failed") 
             _memcache_failure_timestamp = now_seconds
             # The return value of set_multi is the original to_set list in 
-            # case of no daemons  responding.
-            if len(ret) != len(to_set.keys()):
+            # case of no daemons responding.
+            if len(result) != len(to_set):
                 LOG.error("Some keys were successfully written to memcache. This case needs further handling.")
                 # xxx: maybe do a self._clear_cache()?
+        '''
 
 def _get_cached_result(self, cache_key, default=[]):
-    global mem_cache, _memcache_failure_timestamp
+    global _memcache_failure_timestamp
 
     if not self._memcache_available():
         return default
@@ -132,9 +373,9 @@ def _get_cached_result(self, cache_key, default=[]):
     cache_id = '/'.join(self.getPhysicalPath())
     key = cache_id + cache_key
     _cache_misses.setdefault(key, 0)
-    res = mem_cache.get(key)
+    result = self._getMemcachedAdapter().get(key, default)
     # todo: Return default if any item in rs is not an integer. How?        
-    if res is None:
+    if result is None:
         # Record the time of the miss. If we keep missing this key
         # then something is wrong with memcache and we must stop
         # hitting it for a while.
@@ -150,13 +391,13 @@ def _get_cached_result(self, cache_key, default=[]):
                 pass
         return default
 
-    _cache_misses[key] = 0       
-    return res
+    _cache_misses[key] = 0  
+    return result
 
-def _invalidate_cache(self, rid=None, index_name=''):
+def _invalidate_cache(self, rid=None, index_name='', immediate=False):
     """ Invalidate cached results affected by rid and / or index_name
     """
-    global mem_cache, _memcache_failure_timestamp
+    global _memcache_failure_timestamp
 
     if not self._memcache_available():
         return
@@ -171,28 +412,27 @@ def _invalidate_cache(self, rid=None, index_name=''):
 
     if rid is not None:
         s_rid = cache_id + str(rid)
-        rid_map = mem_cache.get(s_rid)
+        rid_map = self._getMemcachedAdapter().get(s_rid, [])        
         if rid_map is not None:
             to_delete.extend(rid_map)
-            to_delete.append(s_rid)
+        to_delete.append(s_rid)
 
     if index_name:
         s_index_name = cache_id + index_name
-        index_map = mem_cache.get(s_index_name) 
+        index_map = self._getMemcachedAdapter().get(s_index_name, []) 
         if index_map is not None:
             to_delete.extend(index_map)
-            to_delete.append(s_index_name)
+        to_delete.append(s_index_name)
 
     if to_delete:
         now_seconds = int(time.time())
         LOG.debug('[%s] Remove %s items from cache' % (cache_id, len(to_delete)))
         # Return value of 1 indicates no error
-        if mem_cache.delete_multi(to_delete) != 1:
+        if self._getMemcachedAdapter().delete_multi(to_delete, immediate=immediate) != 1:
             LOG.error("_invalidate_cache delete_multi failed")
             _memcache_failure_timestamp = now_seconds
 
-def _clear_cache(self):
-    global mem_cache
+def _clear_cache(self):  
     if not self._memcache_available():
         return
     LOG.debug('Flush cache')
@@ -200,7 +440,7 @@ def _clear_cache(self):
     # xxx: This flushes all caches which is inefficient. Currently
     # there is no way to delete all keys starting with eg. 
     # /site/portal_catalog
-    mem_cache.flush_all()
+    self._getMemcachedAdapter().flush_all()
     _hits.clear()
     _misses.clear()
 
@@ -397,7 +637,6 @@ def search(self, request, sort_index=None, reverse=0, limit=None, merge=1):
 
     # Note that if the indexes find query arguments, but the end result
     # is an empty sequence, we do nothing
-    global mem_cache
     cache_id = '/'.join(self.getPhysicalPath())
     cache_key = self._get_cache_key(request)
     _misses.setdefault(cache_id, 0)
@@ -428,6 +667,7 @@ def search(self, request, sort_index=None, reverse=0, limit=None, merge=1):
         except KeyError:
             pass
     else:
+        #LOG.debug('[%s] HIT: %s' % (cache_id, cache_key)) 
         try:
             _hits[cache_id] += 1
         except KeyError:
@@ -517,7 +757,7 @@ def __getitem__(self, index, ttype=type(())):
         # needed since we started using transaction aware caching.
         if not self.data.has_key(key) or not isinstance(key, types.IntType):
             LOG.error("Weighted rid %s leads to KeyError. Removing from cache." % index)
-            self._invalidate_cache(rid=index)
+            self._invalidate_cache(rid=index, immediate=True)
         r=self._v_result_class(self.data[key]).__of__(self.aq_parent)
         r.data_record_id_ = key
         r.data_record_score_ = score
@@ -526,7 +766,7 @@ def __getitem__(self, index, ttype=type(())):
         # otherwise no score, set all scores to 1
         if not self.data.has_key(index) or not isinstance(index, types.IntType):
             LOG.error("rid %s leads to KeyError. Removing from cache." % index)
-            self._invalidate_cache(rid=index)
+            self._invalidate_cache(rid=index, immediate=True)
         r=self._v_result_class(self.data[index]).__of__(self.aq_parent)
         r.data_record_id_ = index
         r.data_record_score_ = 1
@@ -534,6 +774,7 @@ def __getitem__(self, index, ttype=type(())):
     return r
 
 from Products.ZCatalog.Catalog import Catalog
+Catalog._getMemcachedAdapter = _getMemcachedAdapter
 Catalog._memcache_available = _memcache_available
 Catalog._cache_result = _cache_result
 Catalog._get_cached_result = _get_cached_result
