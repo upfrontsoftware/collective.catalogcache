@@ -755,7 +755,7 @@ def __getitem__(self, index, ttype=type(())):
         # Memcache may be responsible for this bad key. Invalidate the
         # cache and let the exception take place. This should never be
         # needed since we started using transaction aware caching.
-        if not self.data.has_key(key) or not isinstance(key, types.IntType):
+        if not isinstance(key, types.IntType) or not self.data.has_key(key):
             LOG.error("Weighted rid %s leads to KeyError. Removing from cache." % index)
             self._invalidate_cache(rid=index, immediate=True)
         r=self._v_result_class(self.data[key]).__of__(self.aq_parent)
@@ -764,7 +764,7 @@ def __getitem__(self, index, ttype=type(())):
         r.data_record_normalized_score_ = normalized_score
     else:
         # otherwise no score, set all scores to 1
-        if not self.data.has_key(index) or not isinstance(index, types.IntType):
+        if not isinstance(index, types.IntType) or not self.data.has_key(index):
             LOG.error("rid %s leads to KeyError. Removing from cache." % index)
             self._invalidate_cache(rid=index, immediate=True)
         r=self._v_result_class(self.data[index]).__of__(self.aq_parent)
